@@ -1,0 +1,288 @@
+base_env: &base_env
+- name: ZYNC_AUTHENTICATION_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: zync
+      key: ZYNC_AUTHENTICATION_TOKEN
+
+apiVersion: v1
+kind: Template
+metadata:
+  name: "system"
+message: ZYNC"
+objects:
+- kind: ImageStream
+  apiVersion: v1
+  metadata:
+    name: amp-zync
+    labels:
+      app: zync
+    annotations:
+      openshift.io/display-name: AMP Zync
+  spec:
+    tags:
+    - name: latest
+      annotations:
+        openshift.io/display-name: AMP Zync (latest)
+      from:
+        kind: ImageStreamTag
+        name: "2.1.0-CR2-redhat-1"
+    - name: "2.1.0-CR2-redhat-1"
+      annotations:
+        openshift.io/display-name: AMP Zync 2.1.0-CR2-redhat-1
+      from:
+        kind: DockerImage
+        name: registry.access.redhat.com/3scale-amp21/zync:1.4-1
+- kind: ConfigMap
+  apiVersion: v1
+  metadata:
+    name: system
+  data:
+    zync.yml: |
+      production:
+        endpoint: 'http://zync:8080'
+        authentication:
+          token: "<%= ENV.fetch('ZYNC_AUTHENTICATION_TOKEN') %>"
+        connect_timeout: 5
+        send_timeout: 5
+        receive_timeout: 10
+        root_url: 'http://system-provider:3000'
+    rolling_updates.yml: |
+      production:
+        old_charts: false
+        new_provider_documentation: false
+        proxy_pro: false
+        instant_bill_plan_change: false
+        service_permissions: true
+        async_apicast_deploy: false
+        duplicate_application_id: true
+        duplicate_user_key: true
+        plan_changes_wizard: false
+        require_cc_on_signup: false
+        apicast_per_service: true
+        new_notification_system: true
+        cms_api: false
+        apicast_v2: true
+        forum: false
+        published_service_plan_signup: true
+        apicast_oidc: true
+- apiVersion: v1
+  kind: ImageStream
+  metadata:
+    name: postgresql
+  spec:
+    tags:
+      - name: '9.5'
+        from:
+          kind: DockerImage
+          name: registry.access.redhat.com/rhscl/postgresql-95-rhel7:9.5
+
+- kind: Secret
+  apiVersion: v1
+  stringData:
+    SECRET_KEY_BASE: "${ZYNC_SECRET_KEY_BASE}"
+    DATABASE_URL: "postgresql://zync:${ZYNC_DATABASE_PASSWORD}@zync-database:5432/zync_production"
+    ZYNC_DATABASE_PASSWORD: "${ZYNC_DATABASE_PASSWORD}"
+    ZYNC_AUTHENTICATION_TOKEN: "${ZYNC_AUTHENTICATION_TOKEN}"
+  metadata:
+    name: zync
+  type: Opaque
+
+- apiVersion: v1
+  kind: DeploymentConfig
+  metadata:
+    annotations:
+    labels:
+      app: zync
+    name: zync
+  spec:
+    replicas: 1
+    selector:
+      app: zync
+      deploymentconfig: zync
+    template:
+      metadata:
+        annotations:
+        labels:
+          app: zync
+          deploymentconfig: zync
+      spec:
+        containers:
+        - image: " "
+          name: zync
+          ports:
+          - containerPort: 8080
+            protocol: TCP
+          resources:
+            limits:
+              cpu: '1'
+              memory: 250Mi
+            requests:
+              cpu: 250m
+              memory: 150M
+          env:
+            - name: RAILS_LOG_TO_STDOUT
+              value: 'true'
+            - name: RAILS_ENV
+              value: production
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: zync
+                  key: DATABASE_URL
+            - name: SECRET_KEY_BASE
+              valueFrom:
+                secretKeyRef:
+                  name: zync
+                  key: SECRET_KEY_BASE
+            - name: ZYNC_AUTHENTICATION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: zync
+                  key: ZYNC_AUTHENTICATION_TOKEN
+          livenessProbe:
+            httpGet:
+              path: /status/live
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 10
+            timeoutSeconds: 60
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /status/ready
+              port: 8080
+              scheme: HTTP
+            initialDelaySeconds: 30
+            timeoutSeconds: 10
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+    triggers:
+    - type: ConfigChange
+    - imageChangeParams:
+        automatic: true
+        containerNames:
+        - zync
+        from:
+          kind: ImageStreamTag
+          name: amp-zync:latest
+      type: ImageChange
+
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      service.alpha.openshift.io/dependencies: '[{"name": "zync-database", "kind": "Service"}]'
+    labels:
+      app: zync
+    name: zync
+  spec:
+    ports:
+    - name: 8080-tcp
+      port: 8080
+      protocol: TCP
+      targetPort: 8080
+    selector:
+      app: zync
+      deploymentconfig: zync
+
+- kind: Service
+  apiVersion: v1
+  metadata:
+    name: "zync-database"
+  spec:
+    ports:
+    - name: postgresql
+      protocol: TCP
+      port: 5432
+      targetPort: 5432
+      nodePort: 0
+    selector:
+      name: "zync-database"
+- kind: DeploymentConfig
+  apiVersion: v1
+  metadata:
+    name: zync-database
+  spec:
+    strategy:
+      type: Recreate
+    triggers:
+    - type: ImageChange
+      imageChangeParams:
+        automatic: true
+        containerNames:
+        - postgresql
+        from:
+          kind: ImageStreamTag
+          name: postgresql:9.5
+    - type: ConfigChange
+    replicas: 1
+    selector:
+      name: "zync-database"
+    template:
+      metadata:
+        labels:
+          name: "zync-database"
+      spec:
+        containers:
+        - name: postgresql
+          image: " "
+          ports:
+          - containerPort: 5432
+            protocol: TCP
+          readinessProbe:
+            timeoutSeconds: 1
+            initialDelaySeconds: 5
+            exec:
+              command:
+              - "/bin/sh"
+              - "-i"
+              - "-c"
+              - psql -h 127.0.0.1 -U zync -q -d zync_production -c 'SELECT 1'
+          livenessProbe:
+            timeoutSeconds: 1
+            initialDelaySeconds: 30
+            tcpSocket:
+              port: 5432
+          env:
+          - name: POSTGRESQL_USER
+            value: zync
+          - name: POSTGRESQL_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: zync
+                key: ZYNC_DATABASE_PASSWORD
+          - name: POSTGRESQL_DATABASE
+            value: "zync_production"
+          resources:
+            limits:
+              memory: "2G"
+          volumeMounts:
+          - name: "zync-database-data"
+            mountPath: "/var/lib/pgsql/data"
+          imagePullPolicy: Always
+        volumes:
+        - name: "zync-database-data"
+          emptyDir:
+            medium: ''
+        restartPolicy: Always
+
+parameters:
+
+- name: ZYNC_DATABASE_PASSWORD
+  displayName: PostgreSQL Connection Password
+  description: Password for the PostgreSQL connection user.
+  generate: expression
+  from: "[a-zA-Z0-9]{16}"
+  required: true
+- name: ZYNC_SECRET_KEY_BASE
+  generate: expression
+  from: "[a-zA-Z0-9]{16}"
+  required: true
+- name: ZYNC_AUTHENTICATION_TOKEN
+  generate: expression
+  from: "[a-zA-Z0-9]{16}"
+  required: true
